@@ -5,11 +5,11 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"errors"
 	"time"
 	"os"
-	"sync"
-	"errors"
 	"io"
+	_ "runtime"
 
 	"github.com/pion/interceptor"
 	"github.com/pion/webrtc/v3"
@@ -66,12 +66,6 @@ func parseFrame(frame []byte) (bool, error) {
 	return frame_type == 0, nil
 }
 
-func websocketWrite(c *websocket.Conn, m sync.Mutex, v interface{}) error {
-	m.Lock()
-	defer m.Unlock()
-	return c.WriteJSON(v)
-}
-
 func handleWebsocket(conn *websocket.Conn, api *webrtc.API, bs *broadcastService) {
 	// Create a new RTCPeerConnection
 	peerConnection, err := api.NewPeerConnection(webrtc.Configuration{})
@@ -81,55 +75,62 @@ func handleWebsocket(conn *websocket.Conn, api *webrtc.API, bs *broadcastService
 	}
 	defer peerConnection.Close()
 
-	// Create websocket mutex
-	var m sync.Mutex
-
-	// Keep alive websocket
+	// Create websocket writer + keep alive
+	wsSend := make(chan interface{})
 	go func() {
 		ping := Ping{true}
-		for range time.Tick(time.Second * 5) {
-			if err := websocketWrite(conn, m, ping); err != nil {
-				return
+		tick := time.NewTicker(time.Second * 5)
+		defer tick.Stop()
+
+		for {
+			select {
+			case <- tick.C:
+				conn.WriteJSON(ping)
+			case v, ok := <- wsSend:
+				if !ok {
+					return
+				}
+				if err = conn.WriteJSON(v); err != nil {
+					// stop writer on error
+					fmt.Fprintln(os.Stderr, err)
+					return
+				}
 			}
 		}
 	}()
+	defer close(wsSend)
 
 	// When Pion gathers a new ICE Candidate send it to the client.
 	peerConnection.OnICECandidate(func(candidate *webrtc.ICECandidate) {
-		if candidate == nil {
-			return
-		}
-		
-		if err = websocketWrite(conn, m, candidate.ToJSON()); err != nil {
-			fmt.Println(err)
-			return
+		if candidate != nil {
+			wsSend <- candidate.ToJSON()
 		}
 	})
 
 	// Add video track
 	videoTrack, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP9}, "video", "pion")
 	if err != nil {
-		fmt.Println(err)
+		fmt.Fprintln(os.Stderr, err)
 		return
 	}
 
 	rtpSender, err := peerConnection.AddTrack(videoTrack)
 	if err != nil {
-		fmt.Println(err)
+		fmt.Fprintln(os.Stderr, err)
 		return
 	}
 
 	go func() {
-		rtcpBuf := make([]byte, 1500)
+		buf := make([]byte, 1500)
 		for {
-			if _, _, rtcpErr := rtpSender.Read(rtcpBuf); rtcpErr != nil {
+			if _, _, err := rtpSender.Read(buf); err != nil {
 				return
 			}
 		}
 	}()
 
 	// frames channel
-	var ch chan []byte = nil
+	var frames chan []byte = nil
 
 	// Set the handler for ICE connection state
 	// This will notify you when the peer has connected/disconnected
@@ -137,28 +138,31 @@ func handleWebsocket(conn *websocket.Conn, api *webrtc.API, bs *broadcastService
 		//fmt.Printf("ICE Connection State has changed: %s\n", connectionState.String())
 
 		if connectionState == webrtc.ICEConnectionStateConnected {
-			if ch != nil {
+			if frames != nil {
 				return
 			}
 
-			ch = bs.add()
+			frames = bs.add()
 
 			go func() {
 				stream := false
 
 				for {
-					frame := <- ch
+					frame, ok := <- frames
 
-					if frame == nil || len(frame) == 0 {
-						bs.del(ch)
+					if !ok {
 						return
+					}
+
+					if len(frame) == 0 {
+						continue
 					}
 
 					keyFrame, err := parseFrame(frame)
 
 					if err != nil {
-						fmt.Println(err)
-						return
+						fmt.Fprintln(os.Stderr, err)
+						continue
 					}
 
 					if !stream && keyFrame {
@@ -169,7 +173,7 @@ func handleWebsocket(conn *websocket.Conn, api *webrtc.API, bs *broadcastService
 						continue
 					}
 
-					//fmt.Println(len(frame))
+					//fmt.Println(len(frame), runtime.NumGoroutine())
 
 					if err := videoTrack.WriteSample(media.Sample{Data: frame, Duration: time.Second}); err != nil {
 						return
@@ -177,8 +181,9 @@ func handleWebsocket(conn *websocket.Conn, api *webrtc.API, bs *broadcastService
 				}
 			}()
 		} else {
-			if ch != nil {
-				ch <- nil
+			if frames != nil {
+				bs.del(frames)
+				frames = nil
 			}
 		}
 	})
@@ -210,8 +215,8 @@ func handleWebsocket(conn *websocket.Conn, api *webrtc.API, bs *broadcastService
 				return
 			}
 
-			answer, answerErr := peerConnection.CreateAnswer(nil)
-			if answerErr != nil {
+			answer, err := peerConnection.CreateAnswer(nil);
+			if err != nil {
 				return
 			}
 
@@ -219,9 +224,7 @@ func handleWebsocket(conn *websocket.Conn, api *webrtc.API, bs *broadcastService
 				return
 			}
 
-			if err = websocketWrite(conn, m, answer); err != nil {
-				return
-			}
+			wsSend <- answer
 		// Attempt to unmarshal as a ICECandidateInit. If the candidate field is empty
 		// assume it is not one.
 		case json.Unmarshal(message, &candidate) == nil && candidate.Candidate != "":
@@ -230,7 +233,6 @@ func handleWebsocket(conn *websocket.Conn, api *webrtc.API, bs *broadcastService
 				return
 			}
 		default:
-			//fmt.Println("DDD", len(message))
 			//fmt.Println(string(message))
 			return
 		}
@@ -376,7 +378,7 @@ func main() {
 	for {
 		frame, _, err := ivf.ParseNextFrame()
 		if errors.Is(err, io.EOF) {
-			fmt.Println("All video frames parsed and sent")
+			//fmt.Println("All video frames parsed and sent")
 			os.Exit(0)
 		}
 
