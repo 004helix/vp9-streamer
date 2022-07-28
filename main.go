@@ -339,7 +339,14 @@ func main() {
 	// Create the API object with the MediaEngine and SettingEngine
 	api := webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithInterceptorRegistry(i), webrtc.WithSettingEngine(s))
 
-	http.Handle("/", http.FileServer(http.Dir(".")))
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/favicon.ico" {
+			return
+		}
+
+		http.ServeFile(w, r, "index.html")
+	})
+
 	http.HandleFunc("/ice", func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
