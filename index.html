@@ -1,0 +1,60 @@
+<html>
+  <head>
+    <title>trickle-ice</title>
+    <style type="text/css">
+      body {
+        //margin: 0;
+        //padding: 0;
+        background: #000000;
+      }
+    </style>
+  </head>
+
+  <body>
+    <video id='remote-video' width='960' height='540' style="width: 100%; height: 100%;" autoplay muted></video>
+  </body>
+
+  <script>
+    const socket = new WebSocket(`ws://${window.location.host}/ice`)
+
+    let pc = new RTCPeerConnection()
+
+    socket.onmessage = e => {
+      let msg = JSON.parse(e.data)
+      if (!msg) {
+        return console.log('failed to parse msg')
+      }
+
+      if (msg.ping) {
+        socket.send('{"pong":true}')
+      } else if (msg.candidate) {
+        pc.addIceCandidate(msg)
+      } else {
+        pc.setRemoteDescription(msg)
+      }
+    }
+
+    pc.ontrack = function (event) {
+      document.getElementById('remote-video').srcObject = event.streams[0]
+    }
+
+    pc.onicecandidate = e => {
+      if (e.candidate && e.candidate.candidate !== "") {
+        socket.send(JSON.stringify(e.candidate))
+      }
+    }
+
+    pc.oniceconnectionstatechange = () => {
+      console.log(pc.iceConnectionState)
+    }
+
+    pc.addTransceiver('video', { direction: 'recvonly' })
+
+    socket.onopen = () => {
+      pc.createOffer().then(offer => {
+        pc.setLocalDescription(offer)
+        socket.send(JSON.stringify(offer))
+      })
+    }
+  </script>
+</html>
