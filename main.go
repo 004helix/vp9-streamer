@@ -85,7 +85,7 @@ func handleWebsocket(conn *websocket.Conn, api *webrtc.API, bs *broadcastService
 				if !ok {
 					return
 				}
-				if err = conn.WriteJSON(v); err != nil {
+				if err := conn.WriteJSON(v); err != nil {
 					// stop writer on error
 					fmt.Fprintln(os.Stderr, err)
 					return
