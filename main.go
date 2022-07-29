@@ -2,21 +2,21 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
-	"errors"
-	"time"
 	"os"
-	"io"
 	_ "runtime"
+	"time"
 
+	"github.com/gorilla/websocket"
+	"github.com/pborman/getopt/v2"
 	"github.com/pion/interceptor"
 	"github.com/pion/webrtc/v3"
 	"github.com/pion/webrtc/v3/pkg/media"
 	"github.com/pion/webrtc/v3/pkg/media/ivfreader"
-	"github.com/gorilla/websocket"
-	"github.com/pborman/getopt/v2"
 )
 
 var upgrader = websocket.Upgrader{
@@ -46,7 +46,7 @@ type Pong struct {
 
 func parseFrame(frame []byte) (bool, error) {
 	// VP9
-	if frame[0] & 0b11000000 != 0b10000000 {
+	if frame[0]&0b11000000 != 0b10000000 {
 		return false, errors.New("not a vp9 frame")
 	}
 
@@ -54,28 +54,23 @@ func parseFrame(frame []byte) (bool, error) {
 	frame_type := frame[0] & 0b00000100
 
 	// if profile == 3
-	if frame[0] & 0b00110000 == 0b00110000 {
+	if frame[0]&0b00110000 == 0b00110000 {
 		show_existing_frame = frame_type
 		frame_type = frame[0] & 0b00000010
 	}
 
 	if show_existing_frame != 0 {
-		return false, errors.New("show_existing_frame == true")
+		return false, nil
 	}
 
+	// VP9 frame_type:
+	//  0 - KEY_FRAME
+	//  1 - INTER_FRAME
 	return frame_type == 0, nil
 }
 
 func handleWebsocket(conn *websocket.Conn, api *webrtc.API, bs *broadcastService) {
-	// Create a new RTCPeerConnection
-	peerConnection, err := api.NewPeerConnection(webrtc.Configuration{})
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-	defer peerConnection.Close()
-
-	// Create websocket writer + keep alive
+	// Create websocket writer goroutine + keep alive
 	wsSend := make(chan interface{})
 	go func() {
 		ping := Ping{true}
@@ -84,9 +79,9 @@ func handleWebsocket(conn *websocket.Conn, api *webrtc.API, bs *broadcastService
 
 		for {
 			select {
-			case <- tick.C:
+			case <-tick.C:
 				conn.WriteJSON(ping)
-			case v, ok := <- wsSend:
+			case v, ok := <-wsSend:
 				if !ok {
 					return
 				}
@@ -100,15 +95,27 @@ func handleWebsocket(conn *websocket.Conn, api *webrtc.API, bs *broadcastService
 	}()
 	defer close(wsSend)
 
+	// Create a new RTCPeerConnection
+	peerConnection, err := api.NewPeerConnection(webrtc.Configuration{})
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	defer peerConnection.Close()
+
 	// When Pion gathers a new ICE Candidate send it to the client.
-	peerConnection.OnICECandidate(func(candidate *webrtc.ICECandidate) {
-		if candidate != nil {
-			wsSend <- candidate.ToJSON()
+	peerConnection.OnICECandidate(func(c *webrtc.ICECandidate) {
+		if c != nil {
+			wsSend <- c.ToJSON()
 		}
 	})
 
 	// Add video track
-	videoTrack, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP9}, "video", "pion")
+	videoTrack, err := webrtc.NewTrackLocalStaticSample(
+		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP9},
+		"video",
+		"pion",
+	)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return
@@ -120,6 +127,9 @@ func handleWebsocket(conn *websocket.Conn, api *webrtc.API, bs *broadcastService
 		return
 	}
 
+	// Read incoming RTCP packets
+	// Before these packets are returned they are processed by interceptors.
+	// For things like NACK this needs to be called.
 	go func() {
 		buf := make([]byte, 1500)
 		for {
@@ -129,11 +139,11 @@ func handleWebsocket(conn *websocket.Conn, api *webrtc.API, bs *broadcastService
 		}
 	}()
 
-	// frames channel
+	// Input frames channel
 	var frames chan []byte = nil
 
 	// Set the handler for ICE connection state
-	// This will notify you when the peer has connected/disconnected
+	// This will enable / disable video stream
 	peerConnection.OnICEConnectionStateChange(func(connectionState webrtc.ICEConnectionState) {
 		//fmt.Printf("ICE Connection State has changed: %s\n", connectionState.String())
 
@@ -148,7 +158,7 @@ func handleWebsocket(conn *websocket.Conn, api *webrtc.API, bs *broadcastService
 				stream := false
 
 				for {
-					frame, ok := <- frames
+					frame, ok := <-frames
 
 					if !ok {
 						return
@@ -165,6 +175,7 @@ func handleWebsocket(conn *websocket.Conn, api *webrtc.API, bs *broadcastService
 						continue
 					}
 
+					// wait the first key frame
 					if !stream && keyFrame {
 						stream = true
 					}
@@ -180,11 +191,13 @@ func handleWebsocket(conn *websocket.Conn, api *webrtc.API, bs *broadcastService
 					}
 				}
 			}()
-		} else {
-			if frames != nil {
-				bs.del(frames)
-				frames = nil
-			}
+
+			return
+		}
+
+		if frames != nil {
+			bs.del(frames)
+			frames = nil
 		}
 	})
 
@@ -215,7 +228,7 @@ func handleWebsocket(conn *websocket.Conn, api *webrtc.API, bs *broadcastService
 				return
 			}
 
-			answer, err := peerConnection.CreateAnswer(nil);
+			answer, err := peerConnection.CreateAnswer(nil)
 			if err != nil {
 				return
 			}
@@ -341,6 +354,7 @@ func main() {
 	// Create the API object with the MediaEngine and SettingEngine
 	api := webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithInterceptorRegistry(i), webrtc.WithSettingEngine(s))
 
+	// Handle index
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/favicon.ico" {
 			return
@@ -349,34 +363,36 @@ func main() {
 		http.ServeFile(w, r, "index.html")
 	})
 
+	// Handle websocket
 	http.HandleFunc("/ice", func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			fmt.Println("Upgrade error:", err)
 			return
 		}
+		defer conn.Close()
+
 		handleWebsocket(conn, api, bs)
-		conn.Close()
 	})
 
-	//fmt.Println("Open http://localhost:8099 to access this demo")
 	go func() {
 		panic(http.ListenAndServe(fmt.Sprintf("%s:%d", httpaddr, int(httpport)), nil))
 	}()
 
-	// Read frame loop
+	// Read ivf data from stdin
 	ivf, header, err := ivfreader.NewWith(os.Stdin)
 	if err != nil {
 		panic(err)
 	}
 
 	if header.FourCC != "VP90" {
-		fmt.Fprintln(os.Stderr, "Unknown codec: %s, only vp9 supported", header.FourCC)
+		fmt.Fprintln(os.Stderr, "Unknown codec: %s", header.FourCC)
 		os.Exit(1)
 	}
 
 	for {
 		frame, _, err := ivf.ParseNextFrame()
+
 		if errors.Is(err, io.EOF) {
 			//fmt.Println("All video frames parsed and sent")
 			os.Exit(0)
