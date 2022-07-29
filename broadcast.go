@@ -3,8 +3,8 @@ package main
 type broadcastService struct {
 	broadcast chan []byte
 	listeners []chan []byte
-	addChan chan (chan []byte)
-	delChan chan (chan []byte)
+	addChan   chan (chan []byte)
+	delChan   chan (chan []byte)
 }
 
 func newBroadcastService() *broadcastService {
@@ -27,9 +27,10 @@ func (bs *broadcastService) del(ch chan []byte) {
 }
 
 func (bs *broadcastService) run() {
-	Loop: for {
+Loop:
+	for {
 		select {
-		case ch := <- bs.addChan:
+		case ch := <-bs.addChan:
 			for i, v := range bs.listeners {
 				if v == nil {
 					bs.listeners[i] = ch
@@ -37,7 +38,7 @@ func (bs *broadcastService) run() {
 				}
 			}
 			bs.listeners = append(bs.listeners, ch)
-		case ch := <- bs.delChan:
+		case ch := <-bs.delChan:
 			for i, v := range bs.listeners {
 				if v == ch {
 					bs.listeners[i] = nil
@@ -45,7 +46,7 @@ func (bs *broadcastService) run() {
 					continue Loop
 				}
 			}
-		case v, ok := <- bs.broadcast:
+		case v, ok := <-bs.broadcast:
 			if !ok {
 				for _, ch := range bs.listeners {
 					if ch != nil {
